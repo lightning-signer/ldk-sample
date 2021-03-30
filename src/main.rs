@@ -3,6 +3,10 @@ mod cli;
 mod convert;
 mod disk;
 mod hex_utils;
+mod keys;
+mod byte_utils;
+mod transaction_utils;
+mod default_signer;
 
 use crate::bitcoind_client::BitcoindClient;
 use crate::disk::FilesystemLogger;
@@ -18,19 +22,19 @@ use bitcoin_bech32::WitnessProgram;
 use lightning::chain;
 use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator};
 use lightning::chain::chainmonitor::ChainMonitor;
-use lightning::chain::keysinterface::{InMemorySigner, KeysInterface, KeysManager};
 use lightning::chain::transaction::OutPoint;
 use lightning::chain::Filter;
 use lightning::chain::Watch;
 use lightning::ln::channelmanager;
 use lightning::ln::channelmanager::{
-	ChainParameters, ChannelManagerReadArgs, PaymentHash, PaymentPreimage, SimpleArcChannelManager,
+	ChainParameters, ChannelManagerReadArgs, PaymentHash, PaymentPreimage,
 };
-use lightning::ln::peer_handler::{MessageHandler, SimpleArcPeerManager};
+use lightning::ln::channelmanager::ChannelManager as RLChannelManager;
+use lightning::ln::peer_handler::PeerManager as RLPeerManager;
+use lightning::ln::peer_handler::MessageHandler;
 use lightning::routing::network_graph::NetGraphMsgHandler;
 use lightning::util::config::UserConfig;
 use lightning::util::events::{Event, EventsProvider};
-use lightning::util::ser::ReadableArgs;
 use lightning_background_processor::BackgroundProcessor;
 use lightning_block_sync::init;
 use lightning_block_sync::poll;
@@ -51,6 +55,11 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
+use crate::cli::LdkUserInfo;
+use lightning::util::ser::ReadableArgs;
+use crate::keys::{KeysManager, DynSigner, DynKeysInterface, SpendableKeysInterface};
+use crate::default_signer::InMemorySignerFactory;
+use lightning::chain::keysinterface::KeysInterface;
 
 #[derive(PartialEq)]
 pub(crate) enum HTLCDirection {
@@ -82,7 +91,7 @@ pub(crate) type PaymentInfoStorage = Arc<
 >;
 
 type ArcChainMonitor = ChainMonitor<
-	InMemorySigner,
+	DynSigner,
 	Arc<dyn Filter>,
 	Arc<BitcoindClient>,
 	Arc<BitcoindClient>,
@@ -90,22 +99,18 @@ type ArcChainMonitor = ChainMonitor<
 	Arc<FilesystemPersister>,
 >;
 
-pub(crate) type PeerManager = SimpleArcPeerManager<
-	SocketDescriptor,
-	ArcChainMonitor,
-	BitcoindClient,
-	BitcoindClient,
-	dyn chain::Access,
-	FilesystemLogger,
->;
+pub(crate) type PeerManager = SimpleArcPeerManager<SocketDescriptor, dyn chain::Access, FilesystemLogger>;
+
+pub(crate) type SimpleArcPeerManager<SD, C, L> = RLPeerManager<SD, Arc<ChannelManager>, Arc<NetGraphMsgHandler<Arc<C>, Arc<L>>>, Arc<L>>;
+
 
 pub(crate) type ChannelManager =
-	SimpleArcChannelManager<ArcChainMonitor, BitcoindClient, BitcoindClient, FilesystemLogger>;
+	RLChannelManager<DynSigner, Arc<ArcChainMonitor>, Arc<BitcoindClient>, Arc<DynKeysInterface>, Arc<BitcoindClient>, Arc<FilesystemLogger>>;
 
 fn handle_ldk_events(
 	peer_manager: Arc<PeerManager>, channel_manager: Arc<ChannelManager>,
 	chain_monitor: Arc<ArcChainMonitor>, bitcoind_client: Arc<BitcoindClient>,
-	keys_manager: Arc<KeysManager>, payment_storage: PaymentInfoStorage, network: Network,
+	keys_manager: Arc<DynKeysInterface>, payment_storage: PaymentInfoStorage, network: Network,
 ) {
 	let mut pending_txs: HashMap<OutPoint, Transaction> = HashMap::new();
 	loop {
@@ -155,15 +160,8 @@ fn handle_ldk_events(
 					};
 					// Give the funding transaction back to LDK for opening the channel.
 					loop_channel_manager
-						.funding_transaction_generated(&temporary_channel_id, outpoint);
+						.funding_transaction_generated(&temporary_channel_id, final_tx.clone()).unwrap();
 					pending_txs.insert(outpoint, final_tx);
-				}
-				Event::FundingBroadcastSafe { funding_txo, .. } => {
-					let funding_tx = pending_txs.remove(&funding_txo).unwrap();
-					bitcoind_client.broadcast_transaction(&funding_tx);
-					println!("\nEVENT: broadcasted funding transaction");
-					print!("> ");
-					io::stdout().flush().unwrap();
 				}
 				Event::PaymentReceived { payment_hash, payment_secret, amt: amt_msat } => {
 					let mut payments = payment_storage.lock().unwrap();
@@ -248,6 +246,7 @@ fn handle_ldk_events(
 					let output_descriptors = &outputs.iter().map(|a| a).collect::<Vec<_>>();
 					let tx_feerate =
 						bitcoind_client.get_est_sat_per_1000_weight(ConfirmationTarget::Normal);
+					// FIXME this is not in KeysInterface
 					let spending_tx = keys_manager
 						.spend_spendable_outputs(
 							output_descriptors,
@@ -276,6 +275,33 @@ fn main() {
 	let ldk_data_dir = format!("{}/.ldk", args.ldk_storage_dir_path);
 	fs::create_dir_all(ldk_data_dir.clone()).unwrap();
 
+	// Step 6: Initialize the KeysManager
+
+	// The key seed that we use to derive the node privkey (that corresponds to the node pubkey) and
+	// other secret key material.
+	let keys_seed_path = format!("{}/keys_seed", ldk_data_dir.clone());
+	let keys_seed = if let Ok(seed) = fs::read(keys_seed_path.clone()) {
+		assert_eq!(seed.len(), 32);
+		let mut key = [0; 32];
+		key.copy_from_slice(&seed);
+		key
+	} else {
+		let mut key = [0; 32];
+		thread_rng().fill_bytes(&mut key);
+		let mut f = File::create(keys_seed_path).unwrap();
+		f.write_all(&key).expect("Failed to write node keys seed to disk");
+		f.sync_all().expect("Failed to sync node keys seed to disk");
+		key
+	};
+	let cur = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+	let factory = InMemorySignerFactory::new(&keys_seed);
+	let manager = Box::new(KeysManager::new(&keys_seed, cur.as_secs(), cur.subsec_nanos(), factory));
+	let keys_manager = Arc::new(DynKeysInterface::new(manager));
+
+	run(keys_manager, args, ldk_data_dir)
+}
+
+fn run(keys_manager: Arc<DynKeysInterface>, args: LdkUserInfo, ldk_data_dir: String) {
 	// Initialize our bitcoind client.
 	let bitcoind_client = match BitcoindClient::new(
 		args.bitcoind_rpc_host.clone(),
@@ -317,27 +343,6 @@ fn main() {
 		fee_estimator.clone(),
 		persister.clone(),
 	));
-
-	// Step 6: Initialize the KeysManager
-
-	// The key seed that we use to derive the node privkey (that corresponds to the node pubkey) and
-	// other secret key material.
-	let keys_seed_path = format!("{}/keys_seed", ldk_data_dir.clone());
-	let keys_seed = if let Ok(seed) = fs::read(keys_seed_path.clone()) {
-		assert_eq!(seed.len(), 32);
-		let mut key = [0; 32];
-		key.copy_from_slice(&seed);
-		key
-	} else {
-		let mut key = [0; 32];
-		thread_rng().fill_bytes(&mut key);
-		let mut f = File::create(keys_seed_path).unwrap();
-		f.write_all(&key).expect("Failed to write node keys seed to disk");
-		f.sync_all().expect("Failed to sync node keys seed to disk");
-		key
-	};
-	let cur = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
-	let keys_manager = Arc::new(KeysManager::new(&keys_seed, cur.as_secs(), cur.subsec_nanos()));
 
 	// Step 7: Read ChannelMonitor state from disk
 	let monitors_path = format!("{}/monitors", ldk_data_dir.clone());
@@ -499,7 +504,8 @@ fn main() {
 	BackgroundProcessor::start(
 		persist_channel_manager_callback,
 		channel_manager.clone(),
-		logger.clone(),
+		peer_manager.clone(),
+		logger.clone()
 	);
 
 	let peer_manager_processor = peer_manager.clone();
