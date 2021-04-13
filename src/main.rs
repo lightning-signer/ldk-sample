@@ -236,8 +236,10 @@ fn handle_ldk_events(
 					let forwarding_channel_manager = loop_channel_manager.clone();
 					thread::spawn(move || {
 						let min = time_forwardable.as_secs();
-						let seconds_to_sleep = thread_rng().gen_range(min, min * 5);
-						thread::sleep(Duration::new(seconds_to_sleep, 0));
+						if min > 0 {
+							let seconds_to_sleep = thread_rng().gen_range(min, min * 5);
+							thread::sleep(Duration::new(seconds_to_sleep, 0));
+						}
 						forwarding_channel_manager.process_pending_htlc_forwards();
 					});
 				}
