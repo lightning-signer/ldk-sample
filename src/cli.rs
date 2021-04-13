@@ -214,7 +214,7 @@ pub(crate) fn poll_for_user_input(
 					let amt_msat = amt_pico_btc.unwrap() / 10;
 
 					let payee_pubkey = invoice.recover_payee_pub_key();
-					let final_cltv = *invoice.min_final_cltv_expiry().unwrap_or(&9) as u32;
+					let final_cltv = *invoice.min_final_cltv_expiry().unwrap_or(&10) as u32;
 
 					let mut payment_hash = PaymentHash([0; 32]);
 					payment_hash.0.copy_from_slice(&invoice.payment_hash().as_ref()[0..32]);
