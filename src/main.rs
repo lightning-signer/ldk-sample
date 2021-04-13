@@ -12,7 +12,7 @@ use bitcoin::consensus::encode;
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::network::constants::Network;
-use bitcoin::secp256k1::Secp256k1;
+use bitcoin::secp256k1::{Secp256k1, PublicKey};
 use bitcoin::BlockHash;
 use bitcoin_bech32::WitnessProgram;
 use lightning::chain;
@@ -507,6 +507,9 @@ fn main() {
 			thread::sleep(Duration::new(60, 0));
 		}
 	});
+
+	let node_pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &keys_manager.get_node_secret());
+	println!("my pubkey {}", node_pubkey);
 
 	// Step 15: Initialize LDK Event Handling
 	let peer_manager_event_listener = peer_manager.clone();
